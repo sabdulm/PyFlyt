@@ -1,6 +1,6 @@
 import gymnasium as gym
 import PyFlyt.gym_envs
-from PyFlyt.gym_envs import FlattenWaypointEnv
+from PyFlyt.gym_envs import FlattenWaypointEnv # <--- Re-added this import
 import pygame
 import numpy as np
 import math
@@ -12,7 +12,7 @@ import datetime
 
 # --- RL IMPORTS ---
 try:
-    from stable_baselines3 import PPO
+    from stable_baselines3 import PPO, SAC
 except ImportError:
     print("Error: Stable Baselines3 not found.")
     print("Please run: pip install stable-baselines3 shimmy")
@@ -23,10 +23,12 @@ parser = argparse.ArgumentParser(description="Universal Drone System: Train, Fly
 
 # RL & Mode Args
 parser.add_argument("--train", action="store_true", help="Training Mode (No Graphics)")
+parser.add_argument("--algo", type=str, choices=["PPO", "SAC"], default="PPO", help="RL Algorithm")
 parser.add_argument("--steps", type=int, default=100000, help="Training timesteps")
 parser.add_argument("--pilot", type=str, choices=["human", "agent"], default="human", help="Who flies?")
 parser.add_argument("--model_path", type=str, default="fixedwing_agent", help="Agent file path (no ext)")
 parser.add_argument("--render-mode", type=str, choices=["human", "none"], default="human", help="Render Mode")
+
 # Visual & Sim Args
 parser.add_argument("--zone", type=float, default=0.0, help="Zone Radius (0 = Auto)")
 parser.add_argument("--disable-hud", action="store_true", help="Disable ALL HUD")
@@ -57,18 +59,23 @@ class NumpyEncoder(json.JSONEncoder):
 # --- 1. TRAINING MODE ---
 if args.train:
     print(f"\n=== TRAINING MODE ===")
+    print(f"Algorithm: {args.algo}")
     print(f"Steps: {args.steps}")
     print(f"Output: {args.model_path}.zip")
-    render_mode = args.render_mode if args.render_mode != "none" else None
-    try:
-        env = gym.make("PyFlyt/Fixedwing-Waypoints-v4", render_mode=render_mode)
-    except:
-        env = gym.make("PyFlyt/Fixedwing-Waypoints-v0", render_mode=render_mode)
-
-    # WRAPPER: Convert Dict obs to Flat Array for MlpPolicy
-    env = FlattenWaypointEnv(env, context_length=2)
     
-    model = PPO("MlpPolicy", env, verbose=1)
+    # 1. Create Headless Environment
+    try:
+        env = gym.make("PyFlyt/Fixedwing-Waypoints-v4", render_mode=None)
+    except:
+        env = gym.make("PyFlyt/Fixedwing-Waypoints-v0", render_mode=None)
+    
+    # 2. FLATTEN THE ENVIRONMENT (Matches your train.py)
+    env = FlattenWaypointEnv(env, context_length=2)
+
+    # 3. Initialize & Train (MlpPolicy for flat envs)
+    ModelClass = SAC if args.algo == "SAC" else PPO
+    model = ModelClass("MlpPolicy", env, verbose=1)
+    
     model.learn(total_timesteps=args.steps)
     model.save(args.model_path)
     
@@ -78,14 +85,16 @@ if args.train:
 
 # --- 2. FLIGHT MODE ---
 
-# Initialize Environment
+# Initialize Environment with Graphics
+render_mode = args.render_mode if args.render_mode != "none" else None
 try:
-    env = gym.make("PyFlyt/Fixedwing-Waypoints-v4", render_mode="human")
+    env = gym.make("PyFlyt/Fixedwing-Waypoints-v4", render_mode=render_mode)
 except:
-    env = gym.make("PyFlyt/Fixedwing-Waypoints-v0", render_mode="human")
+    env = gym.make("PyFlyt/Fixedwing-Waypoints-v0", render_mode=render_mode)
 
-# WRAPPER: Must match training!
+# === CRITICAL FIX: APPLY SAME WRAPPER AS TRAINING ===
 env = FlattenWaypointEnv(env, context_length=2)
+# ====================================================
 
 # Load Agent
 agent_model = None
@@ -93,9 +102,15 @@ if args.pilot == "agent":
     path = f"{args.model_path}.zip"
     if not os.path.exists(path):
         print(f"Error: Agent file '{path}' not found.")
+        print("Train one first using --train")
         sys.exit()
-    agent_model = PPO.load(path)
-    print(f"Agent Loaded: {path}")
+    
+    print(f"Loading {args.algo} Agent from {path}...")
+    
+    # Select correct class for loading
+    ModelClass = SAC if args.algo == "SAC" else PPO
+    agent_model = ModelClass.load(path)
+    print("Agent Loaded. AI has control.")
 
 # Detect Zone
 ZONE_RADIUS = args.zone
@@ -113,15 +128,14 @@ except: import pybullet as p
 # Pygame Setup
 pygame.init()
 pygame.joystick.init()
-MAIN_RENDER_W, MAIN_RENDER_H = 960, 540 # Half 1080p for speed
+MAIN_RENDER_W, MAIN_RENDER_H = 960, 540
 WINDOW_W, WINDOW_H = 1920, 1080 
 screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
-pygame.display.set_caption(f"Pilot: {args.pilot.upper()} | Recording Data")
+pygame.display.set_caption(f"Pilot: {args.pilot.upper()} | Algo: {args.algo}")
 
-# --- FIX: Define PIP Variables ---
+# PIP Settings
 PIP_SIZE = (240, 180)
 PIP_POS = (WINDOW_W - 250, 10)
-# ---------------------------------
 
 font = pygame.font.SysFont("monospace", 20, bold=True)
 warning_font = pygame.font.SysFont("monospace", 40, bold=True)
@@ -147,9 +161,10 @@ def save_data():
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     npz_filename = os.path.join(output_dir, f"log_{args.pilot}_{timestamp}.npz")
     print(f"\nSaving {len(data_buffer['observations'])} steps...")
+    
     np.savez_compressed(
         npz_filename,
-        obs=np.array(data_buffer["observations"]),
+        obs=np.array(data_buffer["observations"], dtype=object),
         actions=np.array(data_buffer["actions"]),
         rewards=np.array(data_buffer["rewards"]),
         dones=np.array(data_buffer["terminals"])
@@ -291,6 +306,7 @@ try:
                 action[3] = np.clip(thrust_cmd, 0.0, 1.0)
                 
             elif args.pilot == "agent":
+                # Agent sees flattened obs
                 action, _states = agent_model.predict(obs, deterministic=True)
 
             # Record
@@ -303,6 +319,7 @@ try:
             data_buffer["terminals"].append(terminated or truncated)
 
             # --- TARGET EXTRACTION ---
+            # Direct Access to internal Waypoints object
             if hasattr(env.unwrapped, "waypoints") and hasattr(env.unwrapped.waypoints, "targets"):
                 abs_targets = env.unwrapped.waypoints.targets
                 current_targets = [t - pos for t in abs_targets]
@@ -318,7 +335,7 @@ try:
 
             if len(data_buffer["observations"]) % LOG_FREQUENCY == 0:
                 print(f"REC {len(data_buffer['observations']):04d} | [RADAR] Targets: {len(current_targets)}")
-                print(f"REC {len(data_buffer['observations']):04d} | [RADAR] Targets Reached: {env.unwrapped.waypoints.num_targets_reached}") 
+                print(f"REC {len(data_buffer['observations']):04d} | [RADAR] Targets Reached: {info.get('num_targets_reached', 0)}")
 
             if terminated or truncated:
                 print(">>> Mission Ended. Resetting...")
@@ -376,12 +393,13 @@ try:
                     pygame.draw.rect(screen, (255, 255, 255), (BOX_X, BOX_Y, 300, 140), 2)
                     lines = [
                         f"PILOT: {args.pilot.upper()}",
+                        f"ALGO:  {args.algo}",
                         f"ALT:   {pos[2]:.1f} m",
                         f"DIST:  {dist:.1f} / {ZONE_RADIUS:.0f}m",
                         f"THR:   {action[3]*100:.0f}%"
                     ]
                     for i, line in enumerate(lines):
-                        color = (255, 50, 50) if (i == 2 and dist > ZONE_RADIUS * 0.9) else (0, 255, 0)
+                        color = (255, 50, 50) if (i == 3 and dist > ZONE_RADIUS * 0.9) else (0, 255, 0)
                         txt = small_font.render(line, True, color)
                         screen.blit(txt, (BOX_X + 20, BOX_Y + 15 + (i * 24)))
 
@@ -405,7 +423,8 @@ try:
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT: running = False
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE: paused = not paused
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_SPACE: paused = not paused
             
             if event.type == pygame.JOYBUTTONDOWN:
                 if event.button == BTN_PAUSE: paused = not paused
