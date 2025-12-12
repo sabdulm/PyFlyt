@@ -100,7 +100,7 @@ except: import pybullet as p
 pygame.init()
 pygame.joystick.init()
 MAIN_W, MAIN_H = 960, 540
-WIN_W, WIN_H = 1920, 1080
+WIN_W, WIN_H = 1024, 768
 screen = pygame.display.set_mode((WIN_W, WIN_H))
 pygame.display.set_caption(f"Pilot: {args.pilot.upper()}")
 

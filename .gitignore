@@ -2,7 +2,9 @@
 .vim/
 
 flight_data/
-
+*.zip
+wandb/
+ppo_tensorboard/
 # vscode
 .vscode/
 
